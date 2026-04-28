@@ -1,0 +1,12 @@
+We’re building on the “Prompt Engineering ChatGPT for Codenames” paper, 
+but making it cleaner and more useful. First, we’ll log everything (each game, 
+every clue and guess, and the exact prompts/responses) and add a simple 
+HTML viewer so we can replay games and see what happened. Second, we’ll 
+turn those logs into a dataset for both roles (codemaster and guesser) and add 
+quick human labels like “good clue coverage,” “risky,” and “stopped on time.” 
+Third, we’ll improve prompts with a 3-step flow: list possible clues/guesses, score 
+their risk, then pick the final choice while thinking about how a teammate would 
+interpret it. We’ll keep outputs in strict JSON so code can parse them, and we’ll 
+measure results by win rate, turns to win, assassin hits, and cost. Final 
+deliverables: the logging + viewer, the labeled dataset, better prompts, and a 
+short report—especially focusing on making the guesser smarter. 

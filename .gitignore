@@ -214,3 +214,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific: large game replay/log files
+results/NoMockMode/
+results/replays/
+results/run_openai.log
+results/run_gemini.log
+results/experiment_results.json.lock
+results/experiment_results.json.tmp
+
+# Derived large dataset files (regenerate with build_dataset.py)
+results/dataset_*.jsonl
+results/dataset_*.csv
+
+# Claude Code session data
+.claude/

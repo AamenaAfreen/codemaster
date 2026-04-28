@@ -1,11 +1,11 @@
 import os
+import concurrent.futures
 from openai import OpenAI
 import time
 from openai import RateLimitError
 import random
 from google import genai
-api_key = os.getenv("OPENAI_API_KEY")
-api_key = os.getenv("GEMINI_API_KEY")
+import anthropic
 
 
 game_rules = """
@@ -55,10 +55,19 @@ class GPT:
                 raise RuntimeError("GEMINI_API_KEY env var is not set")
             self.client = genai.Client(api_key=api_key)
 
+        elif self.provider == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY env var is not set")
+            self.client = anthropic.Anthropic(api_key=api_key)
+
         else:
             raise ValueError(f"Unknown LLM provider: {self.provider}")
 
+        # system prompt stored separately for Anthropic (not in messages array)
+        self.system_prompt = system_prompt
         self.conversation_history = [{"role": "system", "content": system_prompt}]
+        self.interaction_log = []
 
     def _mock_reply(self, prompt: str) -> str:
         text = prompt.lower()
@@ -68,11 +77,29 @@ class GPT:
             return "DOG, CAT"
         return "SAFE"
 
-    def talk_to_ai(self, prompt: str, max_retries: int = 5) -> str:
+    def reset_history(self):
+        """Keep only the system prompt, discard prior turns to reduce token usage."""
+        self.conversation_history = [self.conversation_history[0]]
+
+    def clear_interaction_log(self):
+        """Clear the interaction log between games."""
+        self.interaction_log = []
+
+    def _log_interaction(self, prompt: str, response: str):
+        self.interaction_log.append({
+            "timestamp": time.time(),
+            "provider": self.provider,
+            "model": self.model_version,
+            "prompt": prompt,
+            "response": response,
+        })
+
+    def talk_to_ai(self, prompt: str, max_retries: int = 5, max_tokens: int = 100, json_mode: bool = False) -> str:
         """
         Send a message to the model, with:
         - optional mock mode (MOCK_GPT=1)
         - retry on RateLimitError for OpenAI
+        - json_mode=True: request structured JSON output (prompt must mention "JSON")
         """
         # Add user message
         self.conversation_history.append({"role": "user", "content": prompt})
@@ -83,36 +110,42 @@ class GPT:
             self.conversation_history.append(
                 {"role": "assistant", "content": response}
             )
+            self._log_interaction(prompt, response)
             return response
 
         # ---------- OpenAI path ----------
         if self.provider == "openai":
+            kwargs = {
+                "messages": self.conversation_history,
+                "model": self.model_version,
+                "max_tokens": max_tokens,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+
             for attempt in range(max_retries):
                 try:
-                    completion = self.client.chat.completions.create(
-                        messages=self.conversation_history,
-                        model=self.model_version,
-                        max_tokens=512,
-                    )
+                    completion = self.client.chat.completions.create(**kwargs)
                     response = completion.choices[0].message.content
                     self.conversation_history.append(
                         {"role": "assistant", "content": response}
                     )
+                    self._log_interaction(prompt, response)
                     return response
 
-                except RateLimitError as e:
+                except (RateLimitError, Exception) as e:
                     if attempt == max_retries - 1:
                         raise
-                    wait_time = (2 ** attempt) + random.random()
+                    # Retry on RateLimit, Timeout, and transient API errors
+                    wait_time = min((2 ** attempt) + random.random(), 30)
                     print(
-                        f"[RateLimit] {e}. "
+                        f"[OpenAI error] {type(e).__name__}: {e}. "
                         f"Retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})..."
                     )
                     time.sleep(wait_time)
 
         # ---------- Gemini path ----------
         if self.provider == "gemini":
-            # Flatten conversation into a single text block
             history_text = ""
             for msg in self.conversation_history:
                 role = msg["role"].upper()
@@ -120,14 +153,50 @@ class GPT:
                 history_text += f"{role}: {content}\n"
             history_text += "ASSISTANT:"
 
-            resp = self.client.models.generate_content(
-                model=self.model_version,  # e.g. "gemini-2.5-flash"
-                contents=history_text,
-            )
-            response = resp.text
-            self.conversation_history.append(
-                {"role": "assistant", "content": response}
-            )
+            config = {"max_output_tokens": max_tokens}
+            if json_mode:
+                config["response_mime_type"] = "application/json"
+
+            for attempt in range(max_retries):
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                        _fut = _ex.submit(
+                            self.client.models.generate_content,
+                            model=self.model_version,
+                            contents=history_text,
+                            config=config,
+                        )
+                        try:
+                            resp = _fut.result(timeout=60)
+                        except concurrent.futures.TimeoutError:
+                            raise RuntimeError("Gemini API call timed out after 60s")
+                    response = resp.text
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": response}
+                    )
+                    self._log_interaction(prompt, response)
+                    return response
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    wait_time = min((2 ** attempt) + random.random(), 30)
+                    print(f"[Gemini error] {e}. Retrying in {wait_time:.1f}s (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(wait_time)
+
+        # ---------- Anthropic path ----------
+        if self.provider == "anthropic":
+            # Anthropic takes system separately; messages must be user/assistant only
+            messages = [m for m in self.conversation_history if m["role"] != "system"]
+            kwargs = {
+                "model": self.model_version,
+                "max_tokens": max_tokens,
+                "system": self.system_prompt,
+                "messages": messages,
+            }
+            response_obj = self.client.messages.create(**kwargs)
+            response = response_obj.content[0].text
+            self.conversation_history.append({"role": "assistant", "content": response})
+            self._log_interaction(prompt, response)
             return response
 
         raise RuntimeError(f"Unsupported provider: {self.provider}")

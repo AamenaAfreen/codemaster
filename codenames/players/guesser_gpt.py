@@ -1,5 +1,6 @@
 import os
 import random
+import json
 from codenames.players.gpt_manager import game_rules, GPT
 from codenames.players.guesser import Guesser
 
@@ -30,13 +31,14 @@ class AIGuesser(Guesser):
             + "Never reveal hidden roles. Only return guesses when asked. "
         )
 
-        # Decide provider + model: OpenAI GPT vs Gemini
+        # Decide provider + model
         provider = os.getenv("LLM_PROVIDER", "openai").lower()
         if provider == "gemini":
             model = "gemini-2.5-flash-lite"
-            # "gemini-3-pro-preview"
+        elif provider == "anthropic":
+            model = "claude-haiku-4-5"
         else:
-            model = "gpt-4o-2024-05-13"
+            model = "gpt-4o-mini"
 
         self.manager = GPT(
             system_prompt=system_prompt,
@@ -90,8 +92,9 @@ class AIGuesser(Guesser):
         # other strategies → ask the model, but with slightly different instructions
         invalid_timer = 0
         response = None
+        self.manager.reset_history()
 
-        while response is None and (self.guesses < self.num or self.num == 0):
+        while response is None and self.guesses < self.num:
             base = (
                 "The remaining words are: " + str(self.get_remaining_options()) + ". "
                 + f"The Codemaster's clue is: ({self.clue}, {self.num}). "
@@ -115,6 +118,12 @@ class AIGuesser(Guesser):
                     base
                     + "First internally evaluate remaining options, but output ONLY 'yes' or 'no'. "
                     + "Say 'yes' if there is at least one strong candidate."
+                )
+            elif label in {"three step", "three-step", "threestep"}:
+                prompt = (
+                    base
+                    + "Think step by step: are there remaining words with high confidence AND low risk "
+                    + "of being a non-Red word? Answer ONLY 'yes' or 'no'."
                 )
             else:  # default (same as your old code)
                 prompt = (
@@ -146,6 +155,8 @@ class AIGuesser(Guesser):
         guess = None
 
         while guess is None:
+            # Reset history on every attempt so retries don't compound token cost
+            self.manager.reset_history()
             remaining = self.get_remaining_options()
 
             # ---------- DEFAULT ----------
@@ -193,7 +204,7 @@ class AIGuesser(Guesser):
                     "List the top 3 candidates and score them 0–1.\n"
                     "Do NOT output the final guess yet."
                 )
-                _ = self.manager.talk_to_ai(reasoning_prompt)
+                _ = self.manager.talk_to_ai(reasoning_prompt, max_tokens=150)
 
                 # step 2: final
                 prompt = (
@@ -213,11 +224,13 @@ class AIGuesser(Guesser):
                 initial_guess = self.manager.talk_to_ai(initial_prompt)
 
                 critique_prompt = (
-                    f"You guessed: {initial_guess}. "
+                    f"Your initial guess was: {initial_guess}. "
                     f"Clue: ({self.clue}, {self.num}). Remaining words: {remaining}. "
-                    "Check if this guess could accidentally be Blue/Civilian/Assassin if this were a real board. "
-                    "If the guess is risky, suggest a safer one from the remaining words. "
-                    "Return ONLY the final safest word."
+                    "You are the RED team guesser. Review whether your initial guess is the strongest match for the clue. "
+                    "Is there a word in the remaining list with an even clearer semantic connection to the clue? "
+                    "Pick the word you are MOST CONFIDENT belongs to the RED team — the one most directly tied to the clue. "
+                    "If you are not sure, keep your initial guess rather than switching. "
+                    "Return ONLY the single best word from the remaining list."
                 )
                 response = self.manager.talk_to_ai(critique_prompt)
 
@@ -230,6 +243,34 @@ class AIGuesser(Guesser):
                     "Internally do the reasoning, but output ONLY the final chosen word."
                 )
                 response = self.manager.talk_to_ai(prompt)
+
+            # ---------- THREE STEP ----------
+            elif label in {"three step", "three-step", "threestep"}:
+                # Step 1: brainstorm candidates with rationale
+                step1_prompt = (
+                    f"We are playing Codenames. Clue: ({self.clue}, {self.num}).\n"
+                    f"Remaining board words: {remaining}.\n"
+                    "List ALL words from the board that could relate to this clue. "
+                    "For each, briefly explain the semantic connection. Do NOT guess yet."
+                )
+                _ = self.manager.talk_to_ai(step1_prompt, max_tokens=150)
+
+                # Step 2: score each candidate for risk
+                step2_prompt = (
+                    "For each candidate above, score the RISK that it is actually a Blue, Civilian, or Assassin word "
+                    "rather than a Red word. Score 1 (very safe — clearly Red) to 5 (very risky — could easily be non-Red). "
+                    "Format: WORD — risk: N — reason: ..."
+                )
+                _ = self.manager.talk_to_ai(step2_prompt, max_tokens=150)
+
+                # Step 3: pick the safest highest-confidence word and return JSON
+                step3_prompt = (
+                    f"Based on the semantic match and risk scores above, pick the single best guess from {remaining}. "
+                    "Choose the word with the strongest clue match AND lowest risk of being non-Red. "
+                    "Return ONLY a JSON object with key 'guess' (string, must be one of the remaining words exactly as listed). "
+                    "Example: {\"guess\": \"MARBLE\"}"
+                )
+                response = self.manager.talk_to_ai(step3_prompt, max_tokens=50, json_mode=True)
 
             # ---------- fallback ----------
             else:
@@ -245,7 +286,15 @@ class AIGuesser(Guesser):
             if not isinstance(response, str):
                 response = str(response)
 
-            candidate = response.strip().upper()
+            # Three Step returns JSON: {"guess": "WORD"}
+            if label in {"three step", "three-step", "threestep"}:
+                try:
+                    data = json.loads(response)
+                    candidate = str(data["guess"]).strip().upper()
+                except Exception:
+                    candidate = response.strip().upper()
+            else:
+                candidate = response.strip().upper()
 
             # plain match
             if candidate in self.words:

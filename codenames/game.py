@@ -8,9 +8,22 @@ import sys
 from pathlib import Path
 
 import colorama
-import gensim.models.keyedvectors as word2vec
-import numpy as np
-from nltk.corpus import wordnet_ic
+
+# Optional heavy dependencies — only needed for non-GPT players
+try:
+    import gensim.models.keyedvectors as word2vec
+except ImportError:
+    word2vec = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from nltk.corpus import wordnet_ic
+except ImportError:
+    wordnet_ic = None
 
 
 # Single canonical log path (JSONL)
@@ -332,7 +345,11 @@ class Game:
                     if self.do_log:
                         self.write_results(game_counter)
                     if getattr(self, "observer", None):
-                        self.observer.on_end(getattr(self, "score", 0), False)
+                        self.observer.on_end(
+                            getattr(self, "score", 0), False,
+                            cm_interactions=getattr(getattr(self.codemaster, "manager", None), "interaction_log", []),
+                            g_interactions=getattr(getattr(self.guesser, "manager", None), "interaction_log", []),
+                        )
                     print("You Lost")
                     print("Game Counter:", game_counter)
 
@@ -342,6 +359,10 @@ class Game:
                     if self.do_log:
                         self.write_results(game_counter)
                     if getattr(self, "observer", None):
-                        self.observer.on_end(getattr(self, "score", 0), True)
+                        self.observer.on_end(
+                            getattr(self, "score", 0), True,
+                            cm_interactions=getattr(getattr(self.codemaster, "manager", None), "interaction_log", []),
+                            g_interactions=getattr(getattr(self.guesser, "manager", None), "interaction_log", []),
+                        )
                     print("You Won")
                     print("Game Counter:", game_counter)

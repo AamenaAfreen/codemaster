@@ -1,7 +1,6 @@
 import os
 import json
 import time
-from dataclasses import dataclass, asdict, field
 import streamlit as st
 
 st.set_page_config(page_title="Codenames GPT", layout="wide")
@@ -9,8 +8,15 @@ st.set_page_config(page_title="Codenames GPT", layout="wide")
 from codenames.game import Game
 from codenames.players.codemaster_gpt import AICodemaster
 from codenames.players.guesser_gpt import AIGuesser
+from codenames.event_log import (
+    EventLog, StreamObserver,
+    save_run, load_run, list_saved_runs, get_save_dir, ensure_save_dir,
+    clean_token, is_marker,
+    ROLE_COLORS, MARKER_WORDS, STRATEGY_LABELS, STRATEGY_DIR,
+)
 
 FIXED_BOARD_SEEDS = [
+    # original 10
     1763425169.8379521,
     1763425590.8460038,
     1763425770.556834,
@@ -21,44 +27,30 @@ FIXED_BOARD_SEEDS = [
     1763426133.7536027,
     1763426173.3689868,
     1763426236.519082,
+    # additional 20 (total = 30)
+    1763426637.7420592,
+    1763426498.6548400,
+    1763426748.5631933,
+    1763426862.6448321,
+    1763427231.0120463,
+    1763427341.5147693,
+    1763427575.8808055,
+    1763427350.9224746,
+    1763427639.0648189,
+    1763427600.0087488,
+    1763427822.3870888,
+    1763428088.8098798,
+    1763428010.7411864,
+    1763428225.6769428,
+    1763428566.0479970,
+    1763428656.2236662,
+    1763428647.5982800,
+    1763428950.9695578,
+    1763429187.4437056,
+    1763428963.5244417,
 ]
 
 # ---------------- UI helpers & styles ----------------
-
-ROLE_COLORS = {
-    "RED":      ("#ffebee", "#e53935"),   # bg, border
-    "BLUE":     ("#e8f0ff", "#1e88e5"),
-    "CIVILIAN": ("#f5f5f5", "#9e9e9e"),
-    "NEUTRAL":  ("#f5f5f5", "#9e9e9e"),
-    "ASSASSIN": ("#fff3e0", "#fb8c00"),
-}
-MARKER_WORDS = {"RED", "BLUE", "CIVILIAN", "NEUTRAL", "ASSASSIN"}
-
-STRATEGY_LABELS = ["Default", "Cautious", "Risky", "COT", "Self Refine", "Solo Performance"]
-STRATEGY_DIR = {
-    "Default": "Default",
-    "Cautious": "Cautious",
-    "Risky": "Risky",
-    "COT": "COT",
-    "Self Refine": "SelfRefine",
-    "Solo Performance": "SoloPerformance",
-}
-
-
-def get_save_dir(mock_mode: bool, cm_strategy_label: str, g_strategy_label: str) -> str:
-    mode_dir = "MockMode" if mock_mode else "NoMockMode"
-    cm_dir = STRATEGY_DIR.get(cm_strategy_label, "Default")
-    g_dir = STRATEGY_DIR.get(g_strategy_label, "Default")
-    combo = f"CM-{cm_dir}__G-{g_dir}"
-    return os.path.join("results", mode_dir, combo)
-
-
-def clean_token(t: str) -> str:
-    return str(t).replace("*", "").strip()
-
-
-def is_marker(t: str) -> bool:
-    return clean_token(t).upper() in MARKER_WORDS
 
 
 def role_at(i, key_grid):
@@ -88,125 +80,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------- Event capture ----------------
-
-
-@dataclass
-class EventLog:
-    seed: float = 0.0
-    board: list = field(default_factory=list)      # CURRENT board (labels only)
-    key_grid: list = field(default_factory=list)   # roles aligned with board
-    timeline: list = field(default_factory=list)   # [{type, ...}]
-    final_score: int = 0
-    did_win: bool = False
-    started_at: float = 0.0                        # wall-clock start
-    run_id: str = ""                               # file name id
-    strategy: str = ""
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, indent=2)
-
-    @staticmethod
-    def from_json(s: str):
-        d = json.loads(s)
-        return EventLog(**d)
-
-
-class StreamObserver:
-    def __init__(self):
-        self.log = EventLog()
-
-    def on_start(self, seed, words_in_play, key_grid):
-        self.log.seed = seed
-        self.log.started_at = time.time()
-        # store cleaned labels; keep key_grid raw for role lookup
-        self.log.board = [clean_token(w).upper() for w in words_in_play]
-        self.log.key_grid = list(key_grid)
-        # first timeline entry contains initial board snapshot
-        self.log.timeline.append(
-            {
-                "type": "start",
-                "board_snapshot": list(self.log.board),
-            }
-        )
-
-    def on_clue(self, turn_num, clue, clue_num):
-        self.log.timeline.append(
-            {
-                "type": "clue",
-                "turn": int(turn_num),
-                "clue": str(clue),
-                "num": int(clue_num),
-            }
-        )
-
-    def on_guess(self, guess_word, role, was_correct):
-        # take a snapshot *before* mutating current board
-        snapshot = list(self.log.board)
-
-        guess_clean = clean_token(guess_word).upper()
-        role_up = str(role).upper()
-
-        # find guessed index in current board (matches label, not markers)
-        idx = None
-        for i, lbl in enumerate(snapshot):
-            if clean_token(lbl).upper() == guess_clean:
-                idx = i
-                break
-
-        if idx is not None and role_up in MARKER_WORDS:
-            # mark this tile in current board as revealed
-            self.log.board[idx] = f"*{role_up}*"
-            # reflect the same in the snapshot we store with this event
-            snapshot[idx] = f"*{role_up}*"
-
-        self.log.timeline.append(
-            {
-                "type": "guess",
-                "guess": guess_clean,
-                "role": role_up,
-                "correct": bool(was_correct),
-                "board_snapshot": snapshot,
-            }
-        )
-
-    def on_end(self, final_score, did_win):
-        # keep did_win as a proper boolean
-        self.log.final_score = int(final_score)
-        self.log.did_win = bool(did_win)
-
-
-# ---------------- Persistence helpers ----------------
-
-
-def ensure_save_dir(mock_mode: bool, cm_strategy_label: str, g_strategy_label: str):
-    os.makedirs(get_save_dir(mock_mode, cm_strategy_label, g_strategy_label), exist_ok=True)
-
-
-def list_saved_runs(mock_mode: bool, cm_strategy_label: str, g_strategy_label: str):
-    ensure_save_dir(mock_mode, cm_strategy_label, g_strategy_label)
-    base = get_save_dir(mock_mode, cm_strategy_label, g_strategy_label)
-    files = [f for f in os.listdir(base) if f.endswith(".json")]
-    files.sort(reverse=True)
-    return files
-
-
-def save_run(log: EventLog, mock_mode: bool, cm_strategy_label: str, g_strategy_label: str):
-    ensure_save_dir(mock_mode, cm_strategy_label, g_strategy_label)
-    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(log.started_at or time.time()))
-    run_id = f"{ts}_{int(log.seed)}.json" if isinstance(log.seed, (int, float)) else f"{ts}.json"
-    log.run_id = run_id
-    path = os.path.join(get_save_dir(mock_mode, cm_strategy_label, g_strategy_label), run_id)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(log.to_json())
-    return run_id
-
-
-def load_run(mock_mode: bool, cm_strategy_label: str, g_strategy_label: str, run_id: str) -> EventLog:
-    path = os.path.join(get_save_dir(mock_mode, cm_strategy_label, g_strategy_label), run_id)
-    with open(path, "r", encoding="utf-8") as f:
-        return EventLog.from_json(f.read())
-
 
 # ---- stats storage on disk ----
 
@@ -229,11 +102,12 @@ def _load_stats_from_disk():
         data.setdefault("Mock", {})
         data.setdefault("OpenAI", {})
         data.setdefault("Gemini", {})
+        data.setdefault("Anthropic", {})
         return data
     except FileNotFoundError:
-        return {"Mock": {}, "OpenAI": {}, "Gemini": {}}
+        return {"Mock": {}, "OpenAI": {}, "Gemini": {}, "Anthropic": {}}
     except Exception:
-        return {"Mock": {}, "OpenAI": {}, "Gemini": {}}
+        return {"Mock": {}, "OpenAI": {}, "Gemini": {}, "Anthropic": {}}
 
 
 def _save_stats_to_disk_atomic(stats_dict: dict):
@@ -291,7 +165,7 @@ def _turns_from_log(log) -> int:
 
 def _provider_bucket_name(mock_mode: bool) -> str:
     """
-    Decide which bucket to log into: 'Mock', 'OpenAI', or 'Gemini'.
+    Decide which bucket to log into: 'Mock', 'OpenAI', 'Gemini', or 'Anthropic'.
     """
     if mock_mode:
         return "Mock"
@@ -299,6 +173,8 @@ def _provider_bucket_name(mock_mode: bool) -> str:
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
     if provider == "gemini":
         return "Gemini"
+    if provider == "anthropic":
+        return "Anthropic"
     return "OpenAI"
 
 
@@ -374,13 +250,14 @@ if "tech_stats" not in st.session_state:
 with st.sidebar:
     st.header("Run a new game")
 
-    # Choose backend: Mock, OpenAI (GPT), or Gemini
+    # Choose backend: Mock, OpenAI (GPT), Gemini, or Anthropic
     backend_choice = st.radio(
         "Backend",
         [
             "Mock (no API calls)",
-            "OpenAI (GPT-4o)",
+            "OpenAI (GPT-4o-mini)",
             "Gemini",
+            "Anthropic (Haiku 4.5)",
         ],
         index=0,
     )
@@ -391,6 +268,9 @@ with st.sidebar:
     elif "Gemini" in backend_choice:
         mock_mode = False
         provider = "gemini"
+    elif "Anthropic" in backend_choice:
+        mock_mode = False
+        provider = "anthropic"
     else:
         mock_mode = False
         provider = "openai"
